@@ -1,0 +1,9 @@
+# upstream cuVSLAM clone (own git repo, checked out at tag v17.0.0) and its wheel
+cuVSLAM/
+*.whl
+__pycache__/
+.vscode/
+# run outputs (tens of GB): keep only the written reports
+results/**
+!results/
+!results/*.md
