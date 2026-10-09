@@ -2,7 +2,7 @@
 
 Physical jumps: a step whose speed > 1.5 m/s or turn rate > 150 deg/s (the mower never exceeds 1.1 m/s, 86 deg/s).
 Step anomaly (needs a local reference trajectory at the same timestamps, e.g. the odometry): |dp - dp_ref| per step.
-Usage: python traj_jumps.py
+Usage: python traj_jumps.py [FE_DIR=results/fe5]  (front end: FE_DIR/<tag>_frontend.txt, SLAM: slam_cuvslam_*.txt)
 """
 import glob
 import sys
@@ -11,11 +11,11 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.argv = sys.argv[:1]
+_argv, sys.argv = sys.argv, sys.argv[:1]
 import backend as B  # noqa: E402
 
 D = Path("/mnt/f/data_set/slam")
-FE = Path("results/fe3")
+FE = Path(_argv[1] if len(_argv) > 1 else "results/fe5")
 
 
 def phys(a):
@@ -24,7 +24,9 @@ def phys(a):
     v = np.linalg.norm(np.diff(a[:, 1:4], axis=0), axis=1)[ok] / dt[ok]
     R = Rotation.from_quat(a[:, 4:8])
     w = np.degrees((R[:-1].inv() * R[1:]).magnitude())[ok] / dt[ok]
-    return int(((v > 1.5) | (w > 150)).sum()), float(v.max()), float(w.max())
+    step = np.linalg.norm(np.diff(a[:, 1:4], axis=0), axis=1)
+    turn = np.degrees((R[:-1].inv() * R[1:]).magnitude())
+    return int(((v > 1.5) | (w > 150)).sum()), float(v.max()), float(w.max()), float(step.max()), float(turn.max())
 
 
 rows = []
@@ -34,10 +36,10 @@ for npz in sorted(FE.glob("*_fe.npz")):
     name = bag.removeprefix("basalt_")
     bas = next(p for p in (D / date / f"vio_basalt_{name}.txt", D / date / bag / f"vio_basalt_{name}.txt") if p.exists())
     slam = np.loadtxt(bas.parent / f"slam_cuvslam_{name}.txt")
-    vio = np.loadtxt(FE / f"{tag}_vio.txt")
+    vio = np.loadtxt(FE / f"{tag}_frontend.txt")  # export_frontend_traj.py
     b = np.loadtxt(bas)
     z = np.load(npz)
-    P = B.vote_odometry(z)
+    P = B.frontend_odometry(z, "in")
     # step anomaly of the SLAM export vs the odometry step expressed in the same (SLAM) frame
     Ms = np.array([B.mat(np.r_[r[1:4], r[4:8]]) for r in slam])
     an = []
@@ -53,9 +55,10 @@ for npz in sorted(FE.glob("*_fe.npz")):
 
 def tot(key, idx):
     return sum(r[key][idx] for r in rows)
-print(f"{'':28s} {'phys jumps':>10s} {'bags with':>9s} {'max v m/s':>10s} {'max w deg/s':>11s}")
-for k, name in (("b", "Basalt VIO"), ("v", "cuSLAM front end (VIO)"), ("s", "cuSLAM SLAM export")):
-    print(f"{name:28s} {tot(k, 0):10d} {sum(r[k][0] > 0 for r in rows):9d} {max(r[k][1] for r in rows):10.2f} {max(r[k][2] for r in rows):11.1f}")
+print(f"{'':28s} {'phys jumps':>10s} {'bags with':>9s} {'max v m/s':>10s} {'max w deg/s':>11s} {'max step m':>10s} {'max turn deg':>12s}")
+for k, name in (("b", "Basalt VIO"), ("v", "cuSLAM front end"), ("s", "cuSLAM SLAM export")):
+    print(f"{name:28s} {tot(k, 0):10d} {sum(r[k][0] > 0 for r in rows):9d} {max(r[k][1] for r in rows):10.2f} {max(r[k][2] for r in rows):11.1f} "
+          f"{max(r[k][3] for r in rows):10.3f} {max(r[k][4] for r in rows):12.1f}")
 n = sum(r["n"] for r in rows)
 print(f"\nSLAM export step anomaly vs odometry ({n} steps): >2 cm {sum(r['a2'] for r in rows)}, >5 cm {sum(r['a5'] for r in rows)}, "
       f">10 cm {sum(r['a10'] for r in rows)}, max {max(r['amax'] for r in rows):.3f} m; yaw >1 deg {sum(r['y1'] for r in rows)}, max {max(r['ymax'] for r in rows):.2f} deg")
