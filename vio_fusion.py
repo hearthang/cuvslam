@@ -9,7 +9,8 @@ accelerometer the way a real VIO (Basalt) does. Here, per main front-end frame (
            - optional non-holonomic prior: body-frame lateral / vertical velocity ~ 0 (ground robot)
            - prior: gravity-levelled start (accelerometer while parked), V0 = 0, gyro bias from the static start
 Solved incrementally with ISAM2; the *online* estimate of each frame (no future data, like Basalt's VIO output)
-is written to {tag}_vio.txt and the final smoothed one to {tag}_vio_smooth.txt (TUM, imu_link).
+is written to {tag}_vio.txt (steps held to the physical limit causally, traj_limit.py) and the final smoothed
+one to {tag}_vio_smooth.txt (TUM, imu_link).
 
 Usage: python vio_fusion.py [FE_DIR=results/fe3] [--jobs 14] [--only TAG] [--suffix S] [param overrides]
 """
@@ -44,6 +45,7 @@ cli = ap.parse_args()
 
 sys.argv = sys.argv[:1]
 import backend  # noqa: E402  (backend parses its own argv at import)
+from traj_limit import limit_causal  # noqa: E402
 
 calib = json.load(open("/mnt/f/data_set/slam/calibration_front_small.json"))["value0"]
 G = 9.81
@@ -168,6 +170,11 @@ def run(tag):
     est = isam.calculateEstimate()
     smooth = [est.atPose3(X(k)).matrix() for k in range(n)]
 
+    # causal jump suppression of the online output (traj_limit.py); the smoothed output is left as solved
+    online_pos, n_clamped = limit_causal(t * 1e-9, np.array([M[:3, 3] for M in online]))
+    for M, pp in zip(online, online_pos):
+        M[:3, 3] = pp
+
     def tum(Ms):
         return np.array([[ts * 1e-9, *M[:3, 3], *Rotation.from_matrix(M[:3, :3]).as_quat()] for ts, M in zip(t, Ms)])
     suf = cli.suffix
@@ -177,6 +184,7 @@ def run(tag):
     return {"tag": tag, "closure_online": float(np.linalg.norm(online[-1][:3, 3] - online[0][:3, 3])),
             "closure_smooth": float(np.linalg.norm(smooth[-1][:3, 3] - smooth[0][:3, 3])),
             "closure_vis": float(np.linalg.norm(P[-1][:3, 3] - P[0][:3, 3])), "zupt_frames": int(zupt.sum()),
+            "clamped_steps": int(n_clamped),
             "acc_bias_end": b_end.accelerometer().tolist(), "gyro_bias_end": b_end.gyroscope().tolist()}
 
 

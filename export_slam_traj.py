@@ -5,7 +5,8 @@ clock), the rest 6 decimals; pose of imu_link in a gravity-aligned world whose o
 The back end optimises keyframes. Every front-end frame (~5.3 Hz) gets the odometry pose times a correction
 (optimised keyframe pose x inverse odometry keyframe pose) interpolated between its two keyframes (translation
 linear, rotation slerp, by time), so keyframe poses are kept exactly and the trajectory has no steps where one
-keyframe's correction hands over to the next.
+keyframe's correction hands over to the next. Steps beyond the mower's physical limits (twice Basalt's largest
+step, see traj_limit.py) are smoothed over the smallest window that respects them.
 
 Usage: python export_slam_traj.py [FE_DIR=results/fe3] [SUFFIX=_v8] [--odom vote] [--dry-run]
        -> /mnt/f/data_set/slam/<date>[/<bag>]/slam_cuvslam_<bag>.txt
@@ -26,6 +27,7 @@ ap.add_argument("--dry-run", action="store_true")
 cli = ap.parse_args()
 sys.argv = sys.argv[:1]
 import backend as B  # noqa: E402
+from traj_limit import limit_window  # noqa: E402
 
 DATA = Path(cli.data)
 
@@ -70,11 +72,13 @@ for f in sorted(fe.glob("*_fe.npz")):
         M = Ci @ P[i]
         out.append([t[i] * 1e-9, *M[:3, 3], *Rotation.from_matrix(M[:3, :3]).as_quat()])
     out = np.array(out)
+    out[:, 1:4], n_win = limit_window(out[:, 0], out[:, 1:4])  # jump suppression, see traj_limit.py
     ref, name = basalt_file(tag)
     dst = ref.parent / f"slam_cuvslam_{name}.txt"
     closure = np.linalg.norm(out[-1, 1:4] - out[0, 1:4])
     kf_closure = np.linalg.norm(opt[-1, 1:4] - opt[0, 1:4])
-    print(f"{tag}: {len(out)} poses, closure {closure:.3f} m (keyframes {kf_closure:.3f}) -> {dst}")
+    print(f"{tag}: {len(out)} poses, closure {closure:.3f} m (keyframes {kf_closure:.3f}), "
+          f"{n_win} jump windows smoothed -> {dst}")
     if not cli.dry_run:
         with open(dst, "w") as fh:
             for r in out:
