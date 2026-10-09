@@ -140,14 +140,14 @@ def make_tracker(inertial):
         multicam_mode=getattr(cuvslam.Tracker.MulticameraMode, args.multicam_mode),
         enable_observations_export=False, enable_landmarks_export=False,
         odometry_mode=cuvslam.Tracker.OdometryMode.Inertial if inertial else cuvslam.Tracker.OdometryMode.Multicamera)
-    for attempt in range(5):  # many processes initialising CUDA at once can get "device busy"
+    for attempt in range(30):  # many processes initialising CUDA at once can get "device busy" (WSL)
         try:
             return cuvslam.Tracker(rig, cfg, None)
         except RuntimeError as ex:
-            if attempt == 4:
+            if attempt == 29:
                 raise
             print(f"tracker init failed ({ex}), retrying", flush=True)
-            time.sleep(5 + 5 * attempt)
+            time.sleep(10 + 10 * np.random.rand())
 
 
 internals = None

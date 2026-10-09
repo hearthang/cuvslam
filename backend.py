@@ -29,7 +29,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("fe_dir", nargs="?", default="results/fe")
 ap.add_argument("--calib", default="/mnt/f/data_set/slam/calibration_front_small.json")
 ap.add_argument("--jobs", type=int, default=12)
-ap.add_argument("--odom", choices=["guard", "in", "st", "hyb", "vote"], default="guard")
+ap.add_argument("--odom", choices=["guard", "in", "st", "hyb", "vote", "fe_in", "fe_gyroguard"], default="guard",
+                help="fe_*: front-end odometry incl. the hand-handling bridge (frontend_odometry)")
 ap.add_argument("--only", default="")
 ap.add_argument("--guard-t", type=float, default=0.05, help="inertial/stereo disagreement over 1 s [m] (+10%% of motion)")
 ap.add_argument("--guard-r", type=float, default=2.0, help="... [deg]")
@@ -597,6 +598,8 @@ def process(tag):
     kf_idx = z["kf_idx"]
     if args.odom == "vote":
         P, n_sub = vote_odometry(z), 0
+    elif args.odom in ("fe_in", "fe_gyroguard"):
+        P, n_sub = frontend_odometry(z, "in" if args.odom == "fe_in" else "gyroguard"), 0
     else:
         P, n_sub = build_odometry(z["pose_in"], z["pose_st"], args.odom, t_ns=z["t"])
     t = z["t"] * 1e-9

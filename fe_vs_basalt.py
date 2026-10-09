@@ -32,7 +32,9 @@ for f in sorted(fe_dir.glob("*_fe.npz")):
     z = np.load(f)
     r = {"tag": tag, "basalt": basalt_closure(tag)}
     for m in modes:
-        if m in ("vote", "vote_nogyro"):
+        if m in ("fe_in", "fe_gyroguard"):
+            P = B.frontend_odometry(z, m[3:])
+        elif m in ("vote", "vote_nogyro"):
             P = B.vote_odometry(z, gyro=(m == "vote"))
         elif m == "in_gyro":
             P = B.clean_chain(z["t"], z["pose_in"], B.gyro_rotvecs(z["imu"], z["t"]))
