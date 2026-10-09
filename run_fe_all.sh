@@ -1,6 +1,6 @@
 #!/bin/bash
 # Front end (run_frontend.py) over every bag in F:/data_set/slam, JOBS in parallel.  Usage: ./run_fe_all.sh [JOBS]
-DATA=/mnt/f/data_set/slam; JOBS=${1:-10}; OUT=results/fe
+DATA=/mnt/f/data_set/slam; JOBS=${1:-10}; OUT=${OUT:-results/fe}
 cd "$(dirname "$0")"; mkdir -p $OUT/logs
 run_one() {
   bag=$1; tag="$(basename "$(dirname "$bag")")_$(basename "$bag")"

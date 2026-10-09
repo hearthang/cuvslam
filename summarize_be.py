@@ -1,14 +1,15 @@
 """Closure error of backend.py outputs vs Basalt VIO (same assume-closed metric as basalt_closure_ratios csv).
 
-Usage: python summarize_be.py SUFFIX [SUFFIX ...]     (e.g. _tin25; "" = default run)
+Usage: [FE_DIR=results/fe] python summarize_be.py SUFFIX [SUFFIX ...]     (e.g. _v7; "" = default run)
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 
-FE = Path("results/fe")
+FE = Path(os.environ.get("FE_DIR", "results/fe"))
 DATA = Path("/mnt/f/data_set/slam")
 
 

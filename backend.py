@@ -29,7 +29,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("fe_dir", nargs="?", default="results/fe")
 ap.add_argument("--calib", default="/mnt/f/data_set/slam/calibration_front_small.json")
 ap.add_argument("--jobs", type=int, default=12)
-ap.add_argument("--odom", choices=["guard", "in", "st"], default="guard")
+ap.add_argument("--odom", choices=["guard", "in", "st", "hyb", "vote"], default="guard")
 ap.add_argument("--only", default="")
 ap.add_argument("--guard-t", type=float, default=0.05, help="inertial/stereo disagreement over 1 s [m] (+10%% of motion)")
 ap.add_argument("--guard-r", type=float, default=2.0, help="... [deg]")
@@ -130,13 +130,24 @@ def build_odometry(pose_in, pose_st, mode, win=16, t_ns=None):
         dt = max((t_ns[k] - t_ns[k - 1]) * 1e-9, 1e-3) if t_ns is not None else 1 / 16
         inc_in = np.linalg.inv(M_in[k - 1]) @ M_in[k] if M_in[k] is not None and M_in[k - 1] is not None else None
         inc_st = np.linalg.inv(M_st[k - 1]) @ M_st[k] if M_st[k] is not None and M_st[k - 1] is not None else None
-        if mode == "st":
-            order = [inc_st, inc_in]
-        elif mode == "in":
-            order = [inc_in, inc_st]
+        if mode == "hyb":
+            # rotation from the inertial tracker (better heading), translation from the stereo tracker (the
+            # inertial one can slowly diverge in velocity); each falls back to the other when implausible
+            rot = next((c for c in (inc_in, inc_st) if plausible(c, dt)), None)
+            tra = next((c for c in (inc_st, inc_in) if plausible(c, dt)), None)
+            inc = None
+            if rot is not None and tra is not None:
+                inc = np.eye(4)
+                inc[:3, :3] = rot[:3, :3]
+                inc[:3, 3] = tra[:3, 3]
         else:
-            order = [inc_st, inc_in] if bad[k] else [inc_in, inc_st]
-        inc = next((c for c in order if plausible(c, dt)), None)
+            if mode == "st":
+                order = [inc_st, inc_in]
+            elif mode == "in":
+                order = [inc_in, inc_st]
+            else:
+                order = [inc_st, inc_in] if bad[k] else [inc_in, inc_st]
+            inc = next((c for c in order if plausible(c, dt)), None)
         if inc is None:  # both trackers glitched: constant-velocity bridge
             inc = prev
             n_implausible += 1
@@ -144,6 +155,98 @@ def build_odometry(pose_in, pose_st, mode, win=16, t_ns=None):
         P.append(P[-1] @ inc)
     build_odometry.n_implausible = n_implausible
     return np.array(P), int(bad.sum())
+
+
+def gyro_rotvecs(imu, t_ns):
+    """Body-frame rotation vector between consecutive frame times from the gyro (bias from the first 1.5 s,
+    when the mower is parked). Frame intervals are ~0.2 s, short enough to sum rate*dt."""
+    ti = imu[:, 0]
+    static = ti < ti[0] + 1.5e9
+    bias = imu[static, 4:7].mean(0) if imu[static, 1:4].std(0).max() < 0.15 else np.array(calib["calib_gyro_bias"][:3])
+    cum = np.vstack([np.zeros(3), np.cumsum((imu[1:, 4:7] - bias) * (np.diff(ti) * 1e-9)[:, None], 0)])
+    c = np.stack([np.interp(t_ns, ti, cum[:, d]) for d in range(3)], 1)
+    return np.diff(c, axis=0)
+
+
+def clean_chain(t_ns, poses, gyro_rv=None, gyro_tol_deg=1.5):
+    """Compose one tracker's own increments, bridging lost frames and physically implausible jumps with the
+    previous increment. With gyro_rv, a frame whose visual rotation disagrees with the gyro by more than
+    gyro_tol_deg takes the gyro rotation (short visual failures, e.g. while turning). Returns 4x4 poses."""
+    M = [mat(r) if not np.isnan(r[0]) else None for r in poses]
+    P, prev = [np.eye(4)], np.eye(4)
+    clean_chain.n_gyro = 0
+    for k in range(1, len(M)):
+        dt = max((t_ns[k] - t_ns[k - 1]) * 1e-9, 1e-3)
+        inc = np.linalg.inv(M[k - 1]) @ M[k] if M[k] is not None and M[k - 1] is not None else None
+        if inc is None or np.linalg.norm(inc[:3, 3]) > MAX_SPEED * dt or \
+                Rotation.from_matrix(inc[:3, :3]).magnitude() > np.radians(MAX_RATE_DEG) * dt:
+            inc = prev.copy()
+            if gyro_rv is not None:
+                inc[:3, :3] = Rotation.from_rotvec(gyro_rv[k - 1]).as_matrix()
+        elif gyro_rv is not None:
+            Rg = Rotation.from_rotvec(gyro_rv[k - 1])
+            if (Rg.inv() * Rotation.from_matrix(inc[:3, :3])).magnitude() > np.radians(gyro_tol_deg):
+                inc = inc.copy()
+                inc[:3, :3] = Rg.as_matrix()
+                clean_chain.n_gyro += 1
+        prev = inc
+        P.append(P[-1] @ inc)
+    return np.array(P)
+
+
+def interp_pose(t_src, P, tq):
+    """Poses of a trajectory at query times (linear position, slerp rotation)."""
+    from scipy.spatial.transform import Slerp
+    tq = np.clip(tq, t_src[0], t_src[-1])
+    out = np.tile(np.eye(4), (len(tq), 1, 1))
+    for d in range(3):
+        out[:, d, 3] = np.interp(tq, t_src, P[:, d, 3])
+    out[:, :3, :3] = Slerp(t_src, Rotation.from_matrix(P[:, :3, :3]))(tq).as_matrix()
+    return out
+
+
+def vote_odometry(z, win_s=5.0, t_switch=0.05, frac_switch=0.02, gyro=True):
+    """Redundant-estimator odometry: the main stereo+IMU tracker, extra stereo+IMU trackers on other frame
+    phases (aux_*) and the stereo tracker. Per window the main tracker's motion is kept unless it is farther
+    than t_switch + frac_switch * distance from the medoid (the estimate closest to all others); then the
+    medoid's motion is used. cuVSLAM's inertial mode occasionally drifts in velocity on one tracker, and the
+    stereo tracker occasionally in translation, independently of each other."""
+    t = z["t"].astype(float)
+    grv = (lambda tt: gyro_rotvecs(z["imu"], tt)) if gyro else (lambda tt: None)
+    cands = [(t, clean_chain(z["t"], z["pose_in"], grv(z["t"])))]
+    k = 0
+    while f"aux_t{k}" in z.files:
+        if len(z[f"aux_t{k}"]) > 10:
+            cands.append((z[f"aux_t{k}"].astype(float), clean_chain(z[f"aux_t{k}"], z[f"aux_pose{k}"],
+                                                                    grv(z[f"aux_t{k}"]))))
+        k += 1
+    cands.append((t, clean_chain(z["t"], z["pose_st"], grv(z["t"]))))
+    tw = np.append(np.arange(t[0], t[-1], win_s * 1e9), t[-1])
+    Pw = [interp_pose(tc, Pc, tw) for tc, Pc in cands]
+    F = [np.eye(4)]
+    choice = []
+    for w in range(len(tw) - 1):
+        rel = [np.linalg.inv(P[w]) @ P[w + 1] for P in Pw]
+        n = len(rel)
+        D = np.zeros((n, n))
+        for a in range(n):
+            for b in range(a + 1, n):
+                E = np.linalg.inv(rel[a]) @ rel[b]
+                D[a, b] = D[b, a] = np.linalg.norm(E[:3, 3]) + 0.5 * Rotation.from_matrix(E[:3, :3]).magnitude()
+        med = int(np.argmin(D.sum(1)))
+        c = 0 if D[0, med] < t_switch + frac_switch * np.linalg.norm(rel[med][:3, 3]) else med
+        choice.append(c)
+        F.append(F[-1] @ rel[c])
+    # per main frame: window start pose + chosen tracker's motion since the window start
+    wi = np.clip(np.searchsorted(tw, t, side="right") - 1, 0, len(tw) - 2)
+    out = np.empty((len(t), 4, 4))
+    for w in np.unique(wi):
+        idx = np.where(wi == w)[0]
+        tc, Pc = cands[choice[w]]
+        Pq = interp_pose(tc, Pc, t[idx])
+        out[idx] = F[w] @ np.linalg.inv(Pw[choice[w]][w]) @ Pq
+    vote_odometry.choice = np.bincount(choice, minlength=len(cands))
+    return out
 
 
 # ---------------- keyframe features ----------------
@@ -396,7 +499,10 @@ def process(tag):
     fe = Path(args.fe_dir)
     z = np.load(fe / f"{tag}_fe.npz")
     kf_idx = z["kf_idx"]
-    P, n_sub = build_odometry(z["pose_in"], z["pose_st"], args.odom, t_ns=z["t"])
+    if args.odom == "vote":
+        P, n_sub = vote_odometry(z), 0
+    else:
+        P, n_sub = build_odometry(z["pose_in"], z["pose_st"], args.odom, t_ns=z["t"])
     t = z["t"] * 1e-9
     Pk = P[kf_idx]
     n = len(kf_idx)
@@ -461,6 +567,12 @@ def process(tag):
     X = x0.reshape(n, 4)
     all_edges = edges + [tuple(l[:8]) for l in loops]
     n_rej = 0
+    if not loops:  # odometry only: integrate the 4-DoF chain (IMU-gravity roll/pitch may differ from x0's)
+        X = x0.reshape(n, 4).copy()
+        for i, j, tm, ym, *_r in edges:
+            c, s_ = np.cos(X[i, 3]), np.sin(X[i, 3])
+            X[j, :3] = X[i, :3] + np.array([c * tm[0] - s_ * tm[1], s_ * tm[0] + c * tm[1], tm[2]])
+            X[j, 3] = wrap(X[i, 3] + ym)
     if loops:
         # graduated non-convexity: a wide kernel first lets the true loops pull a metres-drifted graph into
         # place (a tight kernel would let the odometry win and reject them), then tighten
@@ -486,7 +598,7 @@ def process(tag):
     odo = np.array([[t[i], *P[i][:3, 3], *Rotation.from_matrix(P[i][:3, :3]).as_quat()] for i in kf_idx])
     np.savetxt(fe / f"{tag}_odo{suf}.txt", odo, fmt="%.6f", header="timestamp tx ty tz qx qy qz qw")
     stats = {"tag": tag, "kf": int(n), "guard_substituted_frames": int(n_sub),
-             "both_implausible_frames": int(build_odometry.n_implausible), "loop_candidates": n_cand,
+             "both_implausible_frames": int(getattr(build_odometry, "n_implausible", 0)) if args.odom != "vote" else 0, "loop_candidates": n_cand,
              "loops_verified": len(loops), "loops_rejected": n_rej,
              "closure_odo_m": float(np.linalg.norm(odo[-1, 1:4] - odo[0, 1:4])),
              "closure_be_m": float(np.linalg.norm(rows[-1, 1:4] - rows[0, 1:4]))}
