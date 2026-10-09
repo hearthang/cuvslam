@@ -168,6 +168,102 @@ def gyro_rotvecs(imu, t_ns):
     return np.diff(c, axis=0)
 
 
+def handling_mask(imu, t_ns, enter_deg=25.0, exit_deg=12.0, release_s=1.0):
+    """Frames where the mower is off the ground (lifted or tipped up by hand), with hysteresis: entered when the
+    accelerometer (low-passed over 0.5 s) is more than enter_deg from vertical, left once it has been below exit_deg
+    for release_s. Normal driving tilts stay below 21 deg here, hand handling reaches 28-85 deg. Causal."""
+    ti = imu[:, 0]
+    cs = np.vstack([np.zeros(3), np.cumsum(imu[:, 1:4], 0)])
+    a, b = np.searchsorted(ti, t_ns - 0.5e9), np.searchsorted(ti, t_ns)
+    g = cs[np.maximum(b, a + 1)] - cs[a]
+    tilt = np.degrees(np.arccos(np.clip(g[:, 2] / np.linalg.norm(g, axis=1), -1, 1)))
+    held = np.zeros(len(t_ns), bool)
+    on, low_since = False, None
+    for k in range(len(t_ns)):
+        if tilt[k] > enter_deg:
+            on, low_since = True, None
+        elif on:
+            if tilt[k] < exit_deg:
+                low_since = t_ns[k] if low_since is None else low_since
+                if t_ns[k] - low_since > release_s * 1e9:
+                    on = False
+            else:
+                low_since = None
+        held[k] = on
+    return held
+
+
+def hold_handling(t_ns, P, imu):
+    """Bridge hand-handling events: while the mower is off the ground its position is held (it is put back where
+    it was lifted, 3-10 cm in this data) and its rotation follows the gyro; odometry resumes when it is down."""
+    held = handling_mask(imu, t_ns)
+    if not held.any():
+        hold_handling.n = 0
+        return P
+    grv = gyro_rotvecs(imu, t_ns)
+    ti = imu[:, 0]
+    out = [P[0]]
+    for k in range(1, len(P)):
+        inc = np.linalg.inv(P[k - 1]) @ P[k]
+        if held[k]:
+            inc = np.eye(4)
+            inc[:3, :3] = Rotation.from_rotvec(grv[k - 1]).as_matrix()
+        elif held[k - 1]:
+            # back on the ground: re-level roll/pitch to the measured gravity (gyro integration through 30-85 deg of
+            # tipping leaves several degrees of tilt error); heading is kept
+            a, b = np.searchsorted(ti, [t_ns[k], t_ns[k] + 0.5e9])
+            u_meas = imu[a:max(b, a + 1), 1:4].mean(0)
+            u_meas /= np.linalg.norm(u_meas)
+            M = out[-1].copy()
+            u_pred = M[:3, :3].T @ np.array([0.0, 0.0, 1.0])
+            Q, _ = Rotation.align_vectors([u_pred], [u_meas])
+            M[:3, :3] = M[:3, :3] @ Q.as_matrix()
+            out[-1] = M
+        out.append(out[-1] @ inc)
+    hold_handling.n = int(held.sum())
+    return np.array(out)
+
+
+def gyroguard_odometry(z, win_s=1.0, tol_deg=3.0):
+    """Stereo+IMU tracker, except in 1 s windows where its rotation disagrees with the integrated gyro by more than
+    tol_deg (e.g. its IMU state is corrupted after the mower was handled): there the stereo tracker is used.
+    Each tracker is first cleaned by the physical gate. Rotation decides, because the two failure modes seen here
+    are a broken inertial state (rotation goes wrong) and stereo translation slips (rotation stays right)."""
+    t = z["t"]
+    grv = gyro_rotvecs(z["imu"], t)
+    Pi = clean_chain(t, z["pose_in"])
+    Ps = clean_chain(t, z["pose_st"])
+    n = len(t)
+    use_st = np.zeros(n, bool)
+    w = max(1, int(round(win_s / max(np.median(np.diff(t)) * 1e-9, 1e-3))))
+    for a in range(0, n - 1, w):
+        b = min(a + w, n - 1)
+        Rg = np.eye(3)
+        for k in range(a, b):
+            Rg = Rg @ Rotation.from_rotvec(grv[k]).as_matrix()
+        Ri = Pi[a][:3, :3].T @ Pi[b][:3, :3]
+        Rs = Ps[a][:3, :3].T @ Ps[b][:3, :3]
+        ei = Rotation.from_matrix(Rg.T @ Ri).magnitude()
+        es = Rotation.from_matrix(Rg.T @ Rs).magnitude()
+        if ei > np.radians(tol_deg) and es < ei:
+            use_st[a + 1:b + 1] = True
+    P = [np.eye(4)]
+    for k in range(1, n):
+        Q = Ps if use_st[k] else Pi
+        P.append(P[-1] @ np.linalg.inv(Q[k - 1]) @ Q[k])
+    gyroguard_odometry.n_st = int(use_st.sum())
+    return np.array(P)
+
+
+def frontend_odometry(z, mode="gyroguard"):
+    """Front-end odometry used downstream: gyroguard (or another build_odometry mode) + hand-handling bridge."""
+    if mode == "gyroguard":
+        P = gyroguard_odometry(z)
+    else:
+        P = build_odometry(z["pose_in"], z["pose_st"], mode, t_ns=z["t"])[0]
+    return hold_handling(z["t"], P, z["imu"])
+
+
 def clean_chain(t_ns, poses, gyro_rv=None, gyro_tol_deg=1.5):
     """Compose one tracker's own increments, bridging lost frames and physically implausible jumps with the
     previous increment. With gyro_rv, a frame whose visual rotation disagrees with the gyro by more than

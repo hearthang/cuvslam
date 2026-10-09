@@ -40,7 +40,8 @@ ap.add_argument("--vis-trans", type=float, default=0.01, help="visual relative t
 ap.add_argument("--vis-trans-frac", type=float, default=0.03, help="... plus this fraction of the step")
 ap.add_argument("--zupt-sigma", type=float, default=0.01, help="m/s; 0 disables zero-velocity priors")
 ap.add_argument("--nhc-sigma", type=float, default=0.0, help="m/s lateral/vertical body velocity; 0 disables")
-ap.add_argument("--odom", default="vote", help="visual odometry from backend: vote | in | st | guard")
+ap.add_argument("--state-skip", type=int, default=1, help="use every N-th odometry frame as a VIO state")
+ap.add_argument("--odom", default="vote", help="visual odometry from backend: vote | in_gyro | in | st | guard")
 cli = ap.parse_args()
 
 sys.argv = sys.argv[:1]
@@ -73,13 +74,38 @@ def nhc_factor(xk, vk, sigma):
 
 
 def run(tag):
+    try:
+        return run_bag(tag)
+    except RuntimeError as ex:  # e.g. GTSAM IndeterminateSystemException while the robot is carried by hand
+        fe = Path(cli.fe_dir)
+        z = np.load(fe / f"{tag}_fe.npz")
+        P = odometry(z)
+        t = z["t"].astype(np.int64)
+        pos, _ = limit_causal(t * 1e-9, P[:, :3, 3].copy())
+        rows = np.array([[ts * 1e-9, *p, *Rotation.from_matrix(M[:3, :3]).as_quat()] for ts, p, M in zip(t, pos, P)])
+        for name in ("vio", "vio_smooth"):
+            np.savetxt(fe / f"{tag}_{name}{cli.suffix}.txt", rows, fmt="%.6f", header="timestamp tx ty tz qx qy qz qw")
+        c = float(np.linalg.norm(pos[-1] - pos[0]))
+        return {"tag": tag, "closure_online": c, "closure_smooth": c, "closure_vis": c, "zupt_frames": 0,
+                "failed": str(ex).splitlines()[0][:200]}
+
+
+def odometry(z):
+    if cli.odom == "vote":
+        return backend.vote_odometry(z)
+    if cli.odom == "in_gyro":
+        return backend.clean_chain(z["t"], z["pose_in"], backend.gyro_rotvecs(z["imu"], z["t"]))
+    return backend.build_odometry(z["pose_in"], z["pose_st"], cli.odom, t_ns=z["t"])[0]
+
+
+def run_bag(tag):
     fe = Path(cli.fe_dir)
     z = np.load(fe / f"{tag}_fe.npz")
     t = z["t"].astype(np.int64)
-    if cli.odom == "vote":
-        P = backend.vote_odometry(z)
-    else:
-        P = backend.build_odometry(z["pose_in"], z["pose_st"], cli.odom, t_ns=z["t"])[0]
+    P = odometry(z)
+    if cli.state_skip > 1:  # VIO states at a lower rate than the odometry (16 Hz states condition poorly when parked)
+        keep = np.r_[np.arange(0, len(t) - 1, cli.state_skip), len(t) - 1]
+        t, P = t[keep], P[keep]
     imu = z["imu"]
     ti = imu[:, 0].astype(np.int64)
     acc, gyr = imu[:, 1:4], imu[:, 4:7] / np.array([1, 1, 1 + cli.gyro_scale_z])
@@ -196,4 +222,5 @@ if __name__ == "__main__":
         for r in pool.imap_unordered(run, tags):
             json.dump(r, open(Path(cli.fe_dir) / f"{r['tag']}_vio{cli.suffix}.json", "w"), indent=1)
             print(f"{r['tag']}: vis {r['closure_vis']:.3f}  vio online {r['closure_online']:.3f}  "
-                  f"smooth {r['closure_smooth']:.3f}  zupt {r['zupt_frames']}", flush=True)
+                  f"smooth {r['closure_smooth']:.3f}  zupt {r['zupt_frames']}"
+                  + (f"  FAILED, odometry written instead: {r['failed']}" if "failed" in r else ""), flush=True)

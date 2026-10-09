@@ -7,3 +7,6 @@ __pycache__/
 results/**
 !results/
 !results/*.md
+# local cuVSLAM source build (see cuVSLAM branch cj/inertial-fusion-experiments)
+cuvslam_build/
+cuvslam_build*.log

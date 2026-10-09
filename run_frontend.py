@@ -8,6 +8,7 @@ Saves per-frame poses of both (imu_link, z-up world), the raw IMU stream and ste
 Usage (cuvslam env): python run_frontend.py BAG [--calib ...] [--out results/fe]
 """
 import argparse
+import collections
 import heapq
 import itertools
 import json
@@ -32,7 +33,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument("bag")
 ap.add_argument("--calib", default="/mnt/f/data_set/slam/calibration_front_small.json")
 ap.add_argument("--mask-bottom", type=int, default=90)
-ap.add_argument("--imu-noise-scale", type=float, default=0.3)
+ap.add_argument("--imu-noise-scale", type=float, default=0.3, help="scale of the calibrated IMU noise (gyro, and accel too unless --acc-noise-scale)")
+ap.add_argument("--acc-noise-scale", type=float, default=None,
+                help="separate scale for the accelerometer noise (mower vibration is ~1 m/s^2, ~7x the x0.3 value)")
 ap.add_argument("--kf-dist", type=float, default=0.25, help="keyframe every N m of stereo-odometry travel")
 ap.add_argument("--kf-angle", type=float, default=8.0, help="... or every N deg of rotation")
 ap.add_argument("--kf-time", type=float, default=3.0, help="... or every N s")
@@ -60,6 +63,11 @@ ap.add_argument("--cam1-dcx", type=float, default=0.0, help="principal-point x s
 ap.add_argument("--inertial-phases", type=int, default=3,
                 help="number of stereo+IMU trackers, each on a different frame phase (0..skip-1); the extra ones are "
                      "redundant estimators for per-window voting (cuVSLAM inertial occasionally drifts in velocity)")
+ap.add_argument("--imu-pnp-robust", type=float, default=None, help="inertial PnP robustifier scale (cuVSLAM default 0.4)")
+ap.add_argument("--reinit-handling", action="store_true",
+                help="re-create the stereo+IMU tracker(s) once the mower is back on the ground after being lifted or "
+                     "tipped by hand (accelerometer tilt > 25 deg, released after 1 s below 12 deg): cuVSLAM's IMU "
+                     "state is corrupted by the handling and does not recover; poses are chained across the restart")
 ap.add_argument("--trackers", default="both", choices=["both", "inertial", "stereo"])
 ap.add_argument("--no-kf", action="store_true", help="do not save keyframe images (experiments)")
 ap.add_argument("--out", default="results/fe")
@@ -115,8 +123,9 @@ imu.rig_from_imu = to_pose(np.eye(4))
 s = args.imu_noise_scale
 imu.gyroscope_noise_density = calib["gyro_noise_std"][0] * s
 imu.gyroscope_random_walk = calib["gyro_bias_std"][0] * s
-imu.accelerometer_noise_density = calib["accel_noise_std"][0] * s
-imu.accelerometer_random_walk = calib["accel_bias_std"][0] * s
+sa = s if args.acc_noise_scale is None else args.acc_noise_scale
+imu.accelerometer_noise_density = calib["accel_noise_std"][0] * sa
+imu.accelerometer_random_walk = calib["accel_bias_std"][0] * sa
 imu.frequency = calib["imu_update_rate"]
 cam_offset_ns = int(calib["cam_time_offset_ns"]) if args.time_offset_ns is None else args.time_offset_ns
 
@@ -141,6 +150,10 @@ def make_tracker(inertial):
             time.sleep(5 + 5 * attempt)
 
 
+internals = None
+if args.imu_pnp_robust is not None:
+    internals = cuvslam.Tracker.Internals()
+    internals.imu_pnp_robustifier_scale = args.imu_pnp_robust
 trk_in = make_tracker(True) if args.trackers != "stereo" else None
 trk_st = make_tracker(False) if args.trackers != "inertial" else None
 n_aux = min(args.inertial_phases, args.skip) - 1 if trk_in is not None else 0
@@ -212,9 +225,25 @@ if args.gyro_bias == "static":
     print(f"gyro bias {gyro_bias} (calib {calib['calib_gyro_bias'][:3]})", flush=True)
     events = itertools.chain(head, events)
 n_stereo = 0
+acc_win = collections.deque()  # (t, accel) over the last 0.5 s, for the off-the-ground detector
+handling_on, low_since, reinit_times = False, None, []
+T_off = np.eye(4)                # inertial-tracker output = T_off @ tracker pose (changes at each restart)
+pending_offset, last_out = False, None
+
+
+def to_mat(r):
+    M = np.eye(4)
+    M[:3, :3] = Rotation.from_quat(r[3:7]).as_matrix()
+    M[:3, 3] = r[:3]
+    return M
+
+
 for t, kind, payload in events:
     if kind == "imu":
         imu_rows.append([t, *payload[0], *payload[1]])
+        acc_win.append((t, payload[0]))
+        while acc_win and acc_win[0][0] < t - 5e8:
+            acc_win.popleft()
         if trk_in is not None:
             meas = cuvslam.ImuMeasurement()
             meas.timestamp_ns = t
@@ -243,10 +272,34 @@ for t, kind, payload in events:
     imgs = [cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_GRAYSCALE) for b in payload]
     if args.rectify:
         imgs = [cv2.remap(im, *mp, cv2.INTER_LINEAR) for im, mp in zip(imgs, rect_maps)]
-    e_in = trk_in.track(t, imgs)[0] if trk_in is not None else None
+    if args.reinit_handling and trk_in is not None and acc_win:
+        g = np.mean([a for _, a in acc_win], axis=0)
+        tilt = np.degrees(np.arccos(np.clip(g[2] / np.linalg.norm(g), -1, 1)))
+        if tilt > 25:
+            handling_on, low_since = True, None
+        elif handling_on:
+            if tilt < 12:
+                low_since = t if low_since is None else low_since
+                if t - low_since > 1e9:  # back on the ground: restart the inertial tracker(s)
+                    handling_on = False
+                    trk_in = make_tracker(True)
+                    trk_aux = [make_tracker(True) for _ in range(n_aux)]
+                    pending_offset = True
+                    reinit_times.append(t)
+                    print(f"  re-initialised stereo+IMU tracker at {(t - frame_t[0]) * 1e-9:.1f} s", flush=True)
+            else:
+                low_since = None
+    e_in = trk_in.track(t, imgs, internals=internals)[0] if trk_in is not None else None
     e_st = trk_st.track(t, imgs)[0] if trk_st is not None else None
     last_frame_t = t
     r_in = row(e_in.world_from_rig.pose if e_in is not None and e_in.world_from_rig is not None else None)
+    if not np.isnan(r_in[0]):
+        if pending_offset and last_out is not None:  # chain the restarted tracker onto the last output pose
+            T_off = last_out @ np.linalg.inv(to_mat(r_in))
+            pending_offset = False
+        M = T_off @ to_mat(r_in)
+        last_out = M
+        r_in = [*M[:3, 3], *Rotation.from_matrix(M[:3, :3]).as_quat()]
     r_st = row(e_st.world_from_rig.pose if e_st is not None and e_st.world_from_rig is not None else None)
     frame_t.append(t)
     pin.append(r_in)
@@ -268,7 +321,7 @@ if not args.no_kf and kfs[-1][0] != len(frame_t) - 1:  # always keep the last fr
     kfs.append((len(frame_t) - 1, last_pair[0], last_pair[1]))
 
 np.savez(f"{args.out}/{tag}_fe.npz", t=np.array(frame_t, np.int64), pose_in=np.array(pin), pose_st=np.array(pst),
-         imu=np.array(imu_rows), kf_idx=np.array([k[0] for k in kfs]),
+         imu=np.array(imu_rows), kf_idx=np.array([k[0] for k in kfs]), reinit_t=np.array(reinit_times, np.int64),
          **{f"aux_t{k}": np.array(aux_t[k], np.int64) for k in range(n_aux)},
          **{f"aux_pose{k}": np.array(aux_pose[k]).reshape(-1, 7) for k in range(n_aux)})
 if not args.no_kf:
