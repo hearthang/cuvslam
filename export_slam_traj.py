@@ -8,7 +8,7 @@ linear, rotation slerp, by time), so keyframe poses are kept exactly and the tra
 keyframe's correction hands over to the next. Steps beyond the mower's physical limits (twice Basalt's largest
 step, see traj_limit.py) are smoothed over the smallest window that respects them.
 
-Usage: python export_slam_traj.py [FE_DIR=results/fe3] [SUFFIX=_v8] [--odom vote] [--dry-run]
+Usage: python export_slam_traj.py [FE_DIR=results/fe5] [SUFFIX=_v10] [--odom fe_in] [--dry-run]
        -> /mnt/f/data_set/slam/<date>[/<bag>]/slam_cuvslam_<bag>.txt
 """
 import argparse
@@ -19,15 +19,15 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 ap = argparse.ArgumentParser()
-ap.add_argument("fe_dir", nargs="?", default="results/fe3")
-ap.add_argument("suffix", nargs="?", default="_v8")
-ap.add_argument("--odom", default="vote", help="odometry the back end was run with")
+ap.add_argument("fe_dir", nargs="?", default="results/fe5")
+ap.add_argument("suffix", nargs="?", default="_v10")
+ap.add_argument("--odom", default="fe_in", help="odometry the back end was run with (fe_in for the fixed front end)")
 ap.add_argument("--data", default="/mnt/f/data_set/slam")
 ap.add_argument("--dry-run", action="store_true")
 cli = ap.parse_args()
 sys.argv = sys.argv[:1]
 import backend as B  # noqa: E402
-from traj_limit import limit_window  # noqa: E402
+from traj_limit import limit_window, limit_window_rot  # noqa: E402
 
 DATA = Path(cli.data)
 
@@ -53,7 +53,12 @@ for f in sorted(fe.glob("*_fe.npz")):
     tag = f.name[:-7]
     z = np.load(f)
     t = z["t"]
-    P = B.vote_odometry(z) if cli.odom == "vote" else B.build_odometry(z["pose_in"], z["pose_st"], cli.odom, t_ns=t)[0]
+    if cli.odom == "vote":
+        P = B.vote_odometry(z)
+    elif cli.odom.startswith("fe_"):
+        P = B.frontend_odometry(z, cli.odom[3:])
+    else:
+        P = B.build_odometry(z["pose_in"], z["pose_st"], cli.odom, t_ns=t)[0]
     kf = z["kf_idx"]
     opt = np.loadtxt(fe / f"{tag}_be{cli.suffix}.txt")
     assert len(opt) == len(kf) and np.allclose(opt[:, 0], t[kf] * 1e-9, atol=1e-5), tag
@@ -73,6 +78,8 @@ for f in sorted(fe.glob("*_fe.npz")):
         out.append([t[i] * 1e-9, *M[:3, 3], *Rotation.from_matrix(M[:3, :3]).as_quat()])
     out = np.array(out)
     out[:, 1:4], n_win = limit_window(out[:, 0], out[:, 1:4])  # jump suppression, see traj_limit.py
+    out[:, 4:8], n_win_rot = limit_window_rot(out[:, 0], out[:, 4:8])
+    n_win += n_win_rot
     ref, name = basalt_file(tag)
     dst = ref.parent / f"slam_cuvslam_{name}.txt"
     closure = np.linalg.norm(out[-1, 1:4] - out[0, 1:4])

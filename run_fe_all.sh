@@ -1,7 +1,7 @@
 #!/bin/bash
 # Front end (run_frontend.py) over every bag in F:/data_set/slam, JOBS in parallel.
-# Usage: [OUT=results/fe] [FE_ENV=cuvslam] ./run_fe_all.sh [JOBS] [run_frontend.py args...]
-DATA=/mnt/f/data_set/slam; JOBS=${1:-10}; shift; OUT=${OUT:-results/fe}; export FE_ENV=${FE_ENV:-cuvslam}
+# Usage: [OUT=results/fe] [FE_ENV=cuvslam-dev] ./run_fe_all.sh [JOBS] [run_frontend.py args...]
+DATA=/mnt/f/data_set/slam; JOBS=${1:-10}; shift; OUT=${OUT:-results/fe}; export FE_ENV=${FE_ENV:-cuvslam-dev}
 cd "$(dirname "$0")"; mkdir -p $OUT/logs
 run_one() {
   bag=$1; shift; tag="$(basename "$(dirname "$bag")")_$(basename "$bag")"

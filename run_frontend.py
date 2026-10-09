@@ -5,14 +5,21 @@
 Saves per-frame poses of both (imu_link, z-up world), the raw IMU stream and stereo keyframe JPEGs
 (selected on stereo-odometry motion) for the offline loop-closure / pose-graph back end (backend.py).
 
-Usage (cuvslam env): python run_frontend.py BAG [--calib ...] [--out results/fe]
+Requires the fixed cuVSLAM build (conda env cuvslam-dev, cuVSLAM branch cj/inertial-fusion-experiments): the
+official v17 wheel's stereo+IMU mode loses translation accuracy in its per-frame inertial PnP. The fix tracks
+every frame with the visual stereo PnP and keeps the IMU in the inertial keyframe SBA
+(CUVSLAM_EXP_FORCE_STEREO_PNP=1, set here by default).
+
+Usage (cuvslam-dev env): python run_frontend.py BAG [--calib ...] [--out results/fe]
 """
 import argparse
 import collections
 import heapq
 import itertools
 import json
+import os
 import pickle
+import sys
 import time
 from pathlib import Path
 
@@ -44,8 +51,9 @@ ap.add_argument("--max-frames", type=int, default=0)
 ap.add_argument("--mask-lr", type=int, default=0, help="left/right image border to ignore [px]")
 ap.add_argument("--mask-top", type=int, default=0)
 ap.add_argument("--rectify", action="store_true", help="undistort kb4 fisheye to pinhole before cuVSLAM")
-ap.add_argument("--skip", type=int, default=3,
-                help="use every N-th stereo frame (16 Hz camera; 5.3 Hz roughly halves cuVSLAM's drift here, 4 Hz breaks)")
+ap.add_argument("--skip", type=int, default=1,
+                help="use every N-th stereo frame (16 Hz camera). With the fixed cuVSLAM 16 Hz is best; only the official "
+                     "build's inertial PnP drifted less at 5.3 Hz (--skip 3)")
 ap.add_argument("--denoise", action="store_true")
 ap.add_argument("--async-sba", action="store_true")
 ap.add_argument("--no-motion-model", action="store_true")
@@ -64,14 +72,28 @@ ap.add_argument("--inertial-phases", type=int, default=3,
                 help="number of stereo+IMU trackers, each on a different frame phase (0..skip-1); the extra ones are "
                      "redundant estimators for per-window voting (cuVSLAM inertial occasionally drifts in velocity)")
 ap.add_argument("--imu-pnp-robust", type=float, default=None, help="inertial PnP robustifier scale (cuVSLAM default 0.4)")
-ap.add_argument("--reinit-handling", action="store_true",
+ap.add_argument("--reinit-handling", action=argparse.BooleanOptionalAction, default=True,
                 help="re-create the stereo+IMU tracker(s) once the mower is back on the ground after being lifted or "
                      "tipped by hand (accelerometer tilt > 25 deg, released after 1 s below 12 deg): cuVSLAM's IMU "
                      "state is corrupted by the handling and does not recover; poses are chained across the restart")
+ap.add_argument("--inertial-pnp", action="store_true",
+                help="use cuVSLAM's own per-frame inertial PnP (the unfixed behaviour) instead of the visual PnP")
+ap.add_argument("--allow-official-cuvslam", action="store_true", help="run even with an official (unfixed) cuVSLAM build")
 ap.add_argument("--trackers", default="both", choices=["both", "inertial", "stereo"])
 ap.add_argument("--no-kf", action="store_true", help="do not save keyframe images (experiments)")
 ap.add_argument("--out", default="results/fe")
 args = ap.parse_args()
+
+OFFICIAL_CUVSLAM_HASHES = {"57f42cc"}  # v17.0.0 release wheel
+_ver = cuvslam.get_version()[0]
+if _ver.split("+")[-1] in OFFICIAL_CUVSLAM_HASHES and not args.allow_official_cuvslam:
+    sys.exit(f"cuVSLAM {_ver} is the official build; use the fixed build (conda env cuvslam-dev), "
+             "or pass --allow-official-cuvslam")
+if args.inertial_pnp:
+    os.environ.pop("CUVSLAM_EXP_FORCE_STEREO_PNP", None)
+else:
+    os.environ.setdefault("CUVSLAM_EXP_FORCE_STEREO_PNP", "1")  # read by cuVSLAM when the first frame is tracked
+print(f"cuVSLAM {_ver}, per-frame {'inertial' if args.inertial_pnp else 'visual'} PnP, {16 / args.skip:.1f} Hz", flush=True)
 
 calib = json.load(open(args.calib))["value0"]
 
