@@ -2,8 +2,10 @@
 
 Basalt format: no header, "timestamp tx ty tz qx qy qz qw" per line, timestamp in seconds (9 decimals, IMU
 clock), the rest 6 decimals; pose of imu_link in a gravity-aligned world whose origin is the first pose.
-The back end optimises keyframes; every front-end frame (~5.3 Hz) gets its keyframe's optimised pose plus the
-odometry motion since that keyframe.
+The back end optimises keyframes. Every front-end frame (~5.3 Hz) gets the odometry pose times a correction
+(optimised keyframe pose x inverse odometry keyframe pose) interpolated between its two keyframes (translation
+linear, rotation slerp, by time), so keyframe poses are kept exactly and the trajectory has no steps where one
+keyframe's correction hands over to the next.
 
 Usage: python export_slam_traj.py [FE_DIR=results/fe3] [SUFFIX=_v8] [--odom vote] [--dry-run]
        -> /mnt/f/data_set/slam/<date>[/<bag>]/slam_cuvslam_<bag>.txt
@@ -13,7 +15,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 ap = argparse.ArgumentParser()
 ap.add_argument("fe_dir", nargs="?", default="results/fe3")
@@ -53,11 +55,19 @@ for f in sorted(fe.glob("*_fe.npz")):
     kf = z["kf_idx"]
     opt = np.loadtxt(fe / f"{tag}_be{cli.suffix}.txt")
     assert len(opt) == len(kf) and np.allclose(opt[:, 0], t[kf] * 1e-9, atol=1e-5), tag
+    C = np.array([mat(opt[k]) @ np.linalg.inv(P[kf[k]]) for k in range(len(kf))])  # per-keyframe correction
     seg = np.clip(np.searchsorted(kf, np.arange(len(t)), side="right") - 1, 0, len(kf) - 1)
     out = []
     for i in range(len(t)):
         k = seg[i]
-        M = mat(opt[k]) @ np.linalg.inv(P[kf[k]]) @ P[i]
+        if k + 1 < len(kf):
+            a = (t[i] - t[kf[k]]) / max(t[kf[k + 1]] - t[kf[k]], 1)
+            Ci = np.eye(4)
+            Ci[:3, 3] = (1 - a) * C[k][:3, 3] + a * C[k + 1][:3, 3]
+            Ci[:3, :3] = Slerp([0, 1], Rotation.from_matrix([C[k][:3, :3], C[k + 1][:3, :3]]))([a]).as_matrix()[0]
+        else:
+            Ci = C[k]
+        M = Ci @ P[i]
         out.append([t[i] * 1e-9, *M[:3, 3], *Rotation.from_matrix(M[:3, :3]).as_quat()])
     out = np.array(out)
     ref, name = basalt_file(tag)
