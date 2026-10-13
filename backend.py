@@ -19,11 +19,13 @@ import pickle
 from multiprocessing import Pool
 from pathlib import Path
 
-import cv2
-import numpy as np
-from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
-from scipy.spatial.transform import Rotation
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")  # one bag per process (Pool); nested threads oversubscribe the CPU
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from scipy.optimize import least_squares  # noqa: E402
+from scipy.sparse import lil_matrix  # noqa: E402
+from scipy.spatial.transform import Rotation  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("fe_dir", nargs="?", default="results/fe")
@@ -51,10 +53,12 @@ ap.add_argument("--gnc", type=float, nargs="+", default=[40, 20, 10, 5, 2], help
 ap.add_argument("--reject-t", type=float, default=0.3)
 ap.add_argument("--reject-yaw", type=float, default=3.0)
 ap.add_argument("--no-loops", action="store_true", help="odometry only (for ablation)")
-args = ap.parse_args()
+ap.add_argument("--cam1-fscale", type=float, default=-0.00038,
+                help="right camera focal correction, as run_frontend.py (self-calibrated with the gyro, selfcal_yaw.py)")
+args = ap.parse_args() if __name__ == "__main__" else ap.parse_args([])
 
 MASK_BOTTOM = 90
-calib = json.load(open(args.calib))["value0"]
+cv2.setNumThreads(1)
 
 
 def _T(d):
@@ -70,10 +74,29 @@ def _kd(i):
             np.array([k["k1"], k["k2"], k["k3"], k["k4"]]))
 
 
-T_IC0, T_IC1 = _T(calib["T_imu_cam"][0]), _T(calib["T_imu_cam"][1])
-T_C1C0 = np.linalg.inv(T_IC1) @ T_IC0
-(K0, D0), (K1, D1) = _kd(0), _kd(1)
-F = K0[0, 0]
+def configure(calib_path=None, cam1_fscale=None):
+    """Set calibration explicitly for library users and standalone offline runs."""
+    global calib, T_IC0, T_IC1, T_C1C0, K0, D0, K1, D1, FEAT_CACHE, F
+    if calib_path is not None:
+        args.calib = str(calib_path)
+    if cam1_fscale is not None:
+        args.cam1_fscale = float(cam1_fscale)
+    with open(args.calib) as fh:
+        calib = json.load(fh)["value0"]
+    T_IC0, T_IC1 = _T(calib["T_imu_cam"][0]), _T(calib["T_imu_cam"][1])
+    T_C1C0 = np.linalg.inv(T_IC1) @ T_IC0
+    (K0, D0), (K1, D1) = _kd(0), _kd(1)
+    K1[:2, :2] *= 1 + args.cam1_fscale
+    # Include the calibration in the cache identity: two nonzero corrections
+    # or different rigs must not silently share the same triangulated features.
+    import hashlib
+    identity = json.dumps([calib, args.cam1_fscale], sort_keys=True).encode()
+    FEAT_CACHE = "feat_" + hashlib.sha256(identity).hexdigest()[:12]
+    F = K0[0, 0]
+
+
+if __name__ == "__main__" or Path(args.calib).exists():
+    configure()
 
 
 def mat(row):
@@ -617,7 +640,7 @@ def process(tag):
 
     loops, n_cand = [], 0
     if not args.no_loops:
-        feat_file = fe / f"{tag}_feat2.pkl"
+        feat_file = fe / f"{tag}_{FEAT_CACHE}.pkl"
         if feat_file.exists():
             feats = pickle.load(open(feat_file, "rb"))
         else:
@@ -658,7 +681,7 @@ def process(tag):
                 Tij, ninl = verify_loop(feats[i], feats[j])
                 if Tij is not None:
                     tm, ym = meas4(Pk[i], Tij, Rrp[i])
-                    loops.append([i, j, tm, ym, 0.05, np.radians(0.5), True, True, ninl])
+                    loops.append([i, j, tm, ym, 0.05, np.radians(0.5), True, True, ninl, Tij])
                     found += 1
 
     # initial values from odometry, then optimise with iterative loop rejection
@@ -704,7 +727,7 @@ def process(tag):
     json.dump(stats, open(fe / f"{tag}_be{suf}.json", "w"), indent=1)
     np.savez(fe / f"{tag}_loops{suf}.npz", ij=np.array([l[:2] for l in loops], int).reshape(-1, 2),
              tm=np.array([l[2] for l in loops]).reshape(-1, 3), ym=np.array([l[3] for l in loops]),
-             ninl=np.array([l[8] for l in loops]), active=np.array([e[7] for e in all_edges[len(edges):]], bool),
+             ninl=np.array([l[8] for l in loops]), T=np.array([l[9] for l in loops]).reshape(-1, 4, 4), active=np.array([e[7] for e in all_edges[len(edges):]], bool),
              path=path, odo4=x0.reshape(n, 4), opt4=X)
     return stats
 
